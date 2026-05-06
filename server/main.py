@@ -140,8 +140,8 @@ async def get_quote(ticker: str):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error fetching quote for {ticker}: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to fetch data for '{ticker}'")
+        logger.error(f"Error fetching quote for {ticker}: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch data for '{ticker}': {type(e).__name__}: {str(e)}")
 
 
 # ─── History Endpoint ─────────────────────────────────────────────
