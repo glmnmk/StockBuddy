@@ -10,6 +10,15 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import yfinance as yf
 import pandas as pd
+import requests
+
+# Configure yfinance to use a browser-like session (fixes cloud IP blocks)
+session = requests.Session()
+session.headers.update({
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.5',
+})
 
 from models import (
     QuoteResponse,
@@ -84,7 +93,7 @@ async def get_quote(ticker: str):
         return cached
 
     try:
-        stock = yf.Ticker(ticker)
+        stock = yf.Ticker(ticker, session=session)
         info = stock.info
 
         if not info or info.get("regularMarketPrice") is None:
@@ -176,7 +185,7 @@ async def get_history(
 
     try:
         period, interval = RANGE_MAP[range_key]
-        stock = yf.Ticker(ticker)
+        stock = yf.Ticker(ticker, session=session)
         hist = stock.history(period=period, interval=interval)
 
         if hist.empty:
@@ -217,7 +226,7 @@ async def get_financials(ticker: str):
         return cached
 
     try:
-        stock = yf.Ticker(ticker)
+        stock = yf.Ticker(ticker, session=session)
         info = stock.info
         
         # Get annual financial data
@@ -375,7 +384,7 @@ async def get_market_overview():
 
     try:
         # Fetch all tickers in one go
-        tickers = yf.Tickers(" ".join(indices))
+        tickers = yf.Tickers(" ".join(indices), session=session)
         results = []
         
         # Override names for display purposes

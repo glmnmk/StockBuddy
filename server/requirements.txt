@@ -4,3 +4,4 @@ gunicorn==22.0.0
 yfinance==0.2.40
 pandas==2.2.2
 pydantic==2.9.0
+requests==2.32.0
