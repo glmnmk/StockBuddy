@@ -12,18 +12,55 @@ import yfinance as yf
 import pandas as pd
 import requests
 import random
+import time
+from bs4 import BeautifulSoup
 
-# Spoof IP and User-Agent to bypass Yahoo's Render IP block
-def get_random_ip():
-    return f"{random.randint(1, 255)}.{random.randint(1, 255)}.{random.randint(1, 255)}.{random.randint(1, 255)}"
+_current_proxy = None
+_proxy_timestamp = 0
+PROXY_TTL = 300  # 5 minutes
+
+def get_working_proxy():
+    global _current_proxy, _proxy_timestamp
+    if _current_proxy and time.time() - _proxy_timestamp < PROXY_TTL:
+        return _current_proxy
+        
+    logging.info("Fetching new free proxy from free-proxy-list.net...")
+    try:
+        res = requests.get('https://free-proxy-list.net/', timeout=10)
+        soup = BeautifulSoup(res.text, 'html.parser')
+        table = soup.find('table', attrs={'class': 'table'})
+        proxies = []
+        for row in table.tbody.find_all('tr'):
+            cols = row.find_all('td')
+            # Look for HTTPS support (index 6 is usually 'yes' or 'no')
+            if cols[6].text.strip().lower() == 'yes':
+                proxies.append(f"http://{cols[0].text.strip()}:{cols[1].text.strip()}")
+        
+        # Test proxies
+        for p in proxies[:15]:  # Test up to 15 proxies
+            try:
+                logging.info(f"Testing proxy {p}")
+                # We test against Yahoo Finance to ensure it's not blocked there
+                test_res = requests.get('https://query2.finance.yahoo.com/v8/finance/chart/AAPL', 
+                                     proxies={'https': p, 'http': p}, timeout=3)
+                if test_res.status_code == 200:
+                    logging.info(f"Found working proxy: {p}")
+                    _current_proxy = p
+                    _proxy_timestamp = time.time()
+                    return _current_proxy
+            except Exception:
+                continue
+    except Exception as e:
+        logging.error(f"Failed to fetch proxies: {e}")
+        
+    logging.warning("No working proxy found. Falling back to None.")
+    return None
 
 session = requests.Session()
 session.headers.update({
     'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
     'Accept-Language': 'en-US,en;q=0.5',
-    'X-Forwarded-For': get_random_ip(),
-    'Client-IP': get_random_ip(),
 })
 
 from models import (
@@ -99,7 +136,7 @@ async def get_quote(ticker: str):
         return cached
 
     try:
-        stock = yf.Ticker(ticker, session=session)
+        stock = yf.Ticker(ticker, session=session, proxy=get_working_proxy())
         info = stock.info
 
         if not info or info.get("regularMarketPrice") is None:
@@ -191,7 +228,7 @@ async def get_history(
 
     try:
         period, interval = RANGE_MAP[range_key]
-        stock = yf.Ticker(ticker, session=session)
+        stock = yf.Ticker(ticker, session=session, proxy=get_working_proxy())
         hist = stock.history(period=period, interval=interval)
 
         if hist.empty:
@@ -232,7 +269,7 @@ async def get_financials(ticker: str):
         return cached
 
     try:
-        stock = yf.Ticker(ticker, session=session)
+        stock = yf.Ticker(ticker, session=session, proxy=get_working_proxy())
         info = stock.info
         
         # Get annual financial data
@@ -390,7 +427,7 @@ async def get_market_overview():
 
     try:
         # Fetch all tickers in one go
-        tickers = yf.Tickers(" ".join(indices), session=session)
+        tickers = yf.Tickers(" ".join(indices), session=session, proxy=get_working_proxy())
         results = []
         
         # Override names for display purposes
