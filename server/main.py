@@ -1,5 +1,7 @@
 """StockBuddy API — WRDS/Compustat primary, yfinance fallback (mirrors mini-aladdin)."""
 import math, logging, os, datetime, urllib.parse, requests
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import pandas as pd
 import sqlalchemy as sa
 import yfinance as yf
@@ -61,6 +63,13 @@ app = FastAPI(title="StockBuddy API", version="2.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
                    allow_methods=["*"], allow_headers=["*"])
 
+_executor = ThreadPoolExecutor(max_workers=8)
+
+async def run_sql(db, sql):
+    """Run a blocking SQL query in a thread so it doesn't block the event loop."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(_executor, db.raw_sql, sql)
+
 # ── Quote ─────────────────────────────────────────────────────────────────────
 @app.get("/api/quote/{ticker}", response_model=QuoteResponse)
 async def get_quote(ticker: str):
@@ -70,63 +79,86 @@ async def get_quote(ticker: str):
     wrds_t = ALIASES.get(ticker, ticker)
     db = get_wrds_connection()
 
-    # Try WRDS first
+    # Try WRDS first — run all 3 queries in parallel
     if db:
         try:
-            # Latest 2 prices
-            pdf = db.raw_sql(f"""
-                SELECT datadate, prccd/NULLIF(ajexdi,0) AS close,
-                       prchd/NULLIF(ajexdi,0) AS high, prcld/NULLIF(ajexdi,0) AS low,
-                       prcod/NULLIF(ajexdi,0) AS open, cshtrd AS volume, cshoc AS shares
-                FROM comp_na_daily_all.secd WHERE tic='{wrds_t}'
-                ORDER BY datadate DESC LIMIT 2""")
+            yr = (datetime.date.today()-datetime.timedelta(days=365)).isoformat()
+
+            # Query 1: latest 2 prices + 52-week hi/lo in one CTE
+            price_sql = f"""
+                WITH ranked AS (
+                    SELECT datadate, prccd/NULLIF(ajexdi,0) AS close,
+                           prchd/NULLIF(ajexdi,0) AS high, prcld/NULLIF(ajexdi,0) AS low,
+                           prcod/NULLIF(ajexdi,0) AS open, cshtrd AS volume, cshoc AS shares,
+                           ROW_NUMBER() OVER (ORDER BY datadate DESC) AS rn
+                    FROM comp_na_daily_all.secd WHERE tic='{wrds_t}'
+                ),
+                yearly AS (
+                    SELECT MAX(prchd/NULLIF(ajexdi,0)) AS wk52hi,
+                           MIN(prcld/NULLIF(ajexdi,0)) AS wk52lo
+                    FROM comp_na_daily_all.secd WHERE tic='{wrds_t}' AND datadate>='{yr}'
+                )
+                SELECT r.*, y.wk52hi, y.wk52lo
+                FROM ranked r, yearly y WHERE r.rn <= 2
+            """
+
+            # Query 2: company info
+            company_sql = f"""
+                SELECT c.conm AS name, c.gsector AS sector, c.busdesc AS description
+                FROM comp_na_daily_all.company c
+                JOIN comp_na_daily_all.names n ON c.gvkey=n.gvkey
+                WHERE n.tic='{wrds_t}' AND CURRENT_DATE BETWEEN n.namedt AND n.nameenddt
+                LIMIT 1"""
+
+            # Query 3: latest annual fundamentals
+            funda_sql = f"""
+                SELECT sale AS rev, ni, dltt AS debt, ceq AS equity,
+                       oibdp AS oi, gp, act, lct, oancf, capx,
+                       epspx AS eps, dvpsx_f AS dy, mkvalt AS mkcap
+                FROM comp_na_daily_all.funda
+                WHERE tic='{wrds_t}' AND indfmt='INDL' AND datafmt='STD'
+                  AND popsrc='D' AND consol='C'
+                ORDER BY datadate DESC LIMIT 1"""
+
+            # Run all 3 in parallel
+            pdf, cdf, fdf = await asyncio.gather(
+                run_sql(db, price_sql),
+                run_sql(db, company_sql),
+                run_sql(db, funda_sql),
+            )
+
             if pdf is not None and not pdf.empty:
-                r = pdf.iloc[0]
-                price = sf(r["close"], 0.0)
-                prev  = sf(pdf.iloc[1]["close"] if len(pdf)>1 else r["close"], price)
-                chg   = round(price - prev, 2)
-                chgp  = round(chg/prev*100 if prev else 0, 2)
-                shares = si(r["shares"])
+                today_row = pdf[pdf["rn"]==1].iloc[0]
+                prev_row  = pdf[pdf["rn"]==2]
+                price  = sf(today_row["close"], 0.0)
+                prev   = sf(prev_row.iloc[0]["close"] if not prev_row.empty else today_row["close"], price)
+                chg    = round(price - prev, 2)
+                chgp   = round(chg/prev*100 if prev else 0, 2)
+                shares = si(today_row["shares"])
+                wkhi   = sf(today_row["wk52hi"])
+                wklo   = sf(today_row["wk52lo"])
 
-                # Company info
-                cdf = db.raw_sql(f"""
-                    SELECT c.conm AS name, c.gsector AS sector, c.gind AS industry,
-                           c.busdesc AS description
-                    FROM comp_na_daily_all.company c
-                    JOIN comp_na_daily_all.names n ON c.gvkey=n.gvkey
-                    WHERE n.tic='{wrds_t}' AND CURRENT_DATE BETWEEN n.namedt AND n.nameenddt
-                    LIMIT 1""")
-                name  = str(cdf["name"].iloc[0])  if not cdf.empty else ticker
-                gsec  = str(cdf["sector"].iloc[0]) if not cdf.empty else None
-                sector= GICS.get(str(gsec).split(".")[0] if gsec else "", None)
-                desc  = str(cdf["description"].iloc[0]) if not cdf.empty else None
-
-                # Fundamentals
-                fdf = db.raw_sql(f"""
-                    SELECT sale AS rev, ni, dltt AS debt, ceq AS equity,
-                           oibdp AS oi, gp, act, lct, oancf, capx,
-                           epspx AS eps, dvpsx_f AS dy, mkvalt AS mkcap
-                    FROM comp_na_daily_all.funda
-                    WHERE tic='{wrds_t}' AND indfmt='INDL' AND datafmt='STD'
-                      AND popsrc='D' AND consol='C'
-                    ORDER BY datadate DESC LIMIT 1""")
+                name   = str(cdf["name"].iloc[0])   if not cdf.empty else ticker
+                gsec   = str(cdf["sector"].iloc[0])  if not cdf.empty else None
+                sector = GICS.get(str(gsec).split(".")[0] if gsec else "", None)
+                desc   = str(cdf["description"].iloc[0]) if not cdf.empty else None
 
                 rev=ni=debt=eq=oi=gp=fcf=cr=mkcap=eps=dy=pm=gm=om=roe=de=None
                 if not fdf.empty:
-                    fr = fdf.iloc[0]
-                    rev   = sf(fr.get("rev"))
-                    ni    = sf(fr.get("ni"))
-                    debt  = sf(fr.get("debt"))
-                    eq    = sf(fr.get("equity"))
-                    oi    = sf(fr.get("oi"))
-                    gp    = sf(fr.get("gp"))
-                    ocf   = sf(fr.get("oancf"))
-                    capx  = sf(fr.get("capx"))
-                    eps   = sf(fr.get("eps"))
-                    dy    = sf(fr.get("dy"))
-                    mkcap = sf(fr.get("mkcap"))
-                    act   = sf(fr.get("act"))
-                    lct   = sf(fr.get("lct"))
+                    fr   = fdf.iloc[0]
+                    rev  = sf(fr.get("rev"))
+                    ni   = sf(fr.get("ni"))
+                    debt = sf(fr.get("debt"))
+                    eq   = sf(fr.get("equity"))
+                    oi   = sf(fr.get("oi"))
+                    gp   = sf(fr.get("gp"))
+                    ocf  = sf(fr.get("oancf"))
+                    capx = sf(fr.get("capx"))
+                    eps  = sf(fr.get("eps"))
+                    dy   = sf(fr.get("dy"))
+                    mkcap= sf(fr.get("mkcap"))
+                    act  = sf(fr.get("act"))
+                    lct  = sf(fr.get("lct"))
                     if ocf and capx: fcf = (ocf - abs(capx)) * 1e6
                     if act and lct and lct!=0: cr = round(act/lct,2)
                     if rev and rev!=0:
@@ -136,9 +168,6 @@ async def get_quote(ticker: str):
                     if ni and eq and eq!=0: roe = round(ni/eq,4)
                     if debt and eq and eq!=0: de = round(debt/eq,2)
                     mkcap = (mkcap*1e6) if mkcap else (price*shares if price and shares else None)
-                    for attr in ["rev","ni","debt","eq"]:
-                        val = locals().get(attr)
-                        if val: locals()[attr]  # already set
                     rev  = rev*1e6  if rev  else None
                     ni   = ni*1e6   if ni   else None
                     debt = debt*1e6 if debt else None
@@ -148,19 +177,12 @@ async def get_quote(ticker: str):
                 pb = round(price/(eq/shares),2) if (price and eq and shares and shares>0 and eq/shares>0) else None
                 ps = round(price/(rev/shares),2) if (price and rev and shares and shares>0) else None
 
-                yr = (datetime.date.today()-datetime.timedelta(days=365)).isoformat()
-                hldf = db.raw_sql(f"""
-                    SELECT MAX(prchd/NULLIF(ajexdi,0)) AS hi, MIN(prcld/NULLIF(ajexdi,0)) AS lo
-                    FROM comp_na_daily_all.secd WHERE tic='{wrds_t}' AND datadate>='{yr}'""")
-                wkhi = sf(hldf["hi"].iloc[0]) if not hldf.empty else None
-                wklo = sf(hldf["lo"].iloc[0]) if not hldf.empty else None
-
                 result = QuoteResponse(
                     ticker=ticker, name=name, price=price, previousClose=prev,
                     change=chg, changePercent=chgp, marketCap=mkcap,
                     peRatio=pe, forwardPE=None, psRatio=ps, pbRatio=pb, beta=None,
                     fiftyTwoWeekHigh=wkhi, fiftyTwoWeekLow=wklo,
-                    volume=si(r["volume"]), avgVolume=None, dividendYield=dy,
+                    volume=si(today_row["volume"]), avgVolume=None, dividendYield=dy,
                     sector=sector, industry=None, description=desc,
                     freeCashFlow=fcf, sharesOutstanding=shares,
                     totalRevenue=rev, netIncome=ni, totalDebt=debt, totalEquity=eq,
