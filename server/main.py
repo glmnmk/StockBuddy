@@ -173,10 +173,12 @@ async def get_quote(ticker: str):
 
         # ── Company info ──────────────────────────────────────────
         company_sql = f"""
-            SELECT conm AS name, gsector AS sector, gind AS industry,
-                   loc AS country, busdesc AS description
-            FROM comp.company
-            WHERE tic = '{wrds_ticker}'
+            SELECT c.conm AS name, c.gsector AS sector, c.gind AS industry,
+                   c.loc AS country, c.busdesc AS description
+            FROM comp_na_daily_all.company c
+            JOIN comp_na_daily_all.names n ON c.gvkey = n.gvkey
+            WHERE n.tic = '{wrds_ticker}'
+              AND CURRENT_DATE BETWEEN n.namedt AND n.nameenddt
             LIMIT 1
         """
         co_df = db.raw_sql(company_sql)
@@ -194,7 +196,7 @@ async def get_quote(ticker: str):
                    oancf AS op_cf, capx, csho AS shares_annual,
                    epspx AS eps, dvpsx_f AS div_yield,
                    mkvalt AS market_cap, at AS total_assets
-            FROM comp.funda
+            FROM comp_na_daily_all.funda
             WHERE tic = '{wrds_ticker}'
               AND indfmt = 'INDL' AND datafmt = 'STD'
               AND popsrc = 'D'   AND consol = 'C'
@@ -434,7 +436,7 @@ async def get_financials(ticker: str):
                    oibdp  AS op_income,
                    gp     AS gross_profit,
                    csho   AS shares
-            FROM comp.funda
+            FROM comp_na_daily_all.funda
             WHERE tic = '{wrds_ticker}'
               AND indfmt = 'INDL' AND datafmt = 'STD'
               AND popsrc = 'D'   AND consol = 'C'
