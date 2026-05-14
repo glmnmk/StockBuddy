@@ -3,7 +3,7 @@ services:
   - type: web
     name: stockbuddy-api
     runtime: python
-    region: frankfurt
+    region: oregon
     plan: free
     rootDir: server
     buildCommand: pip install -r requirements.txt
