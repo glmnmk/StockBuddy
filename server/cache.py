@@ -47,7 +47,8 @@ class TTLCache:
 cache = TTLCache()
 
 # Cache TTL constants (seconds)
-QUOTE_TTL = 120       # 2 minutes for live quotes
-FINANCIALS_TTL = 3600 # 1 hour for financial statements
-HISTORY_TTL = 300     # 5 minutes for price history
-SEARCH_TTL = 600      # 10 minutes for search results
+# WRDS/Compustat is end-of-day data, so we can cache aggressively
+QUOTE_TTL = 1800        # 30 minutes for quotes (EOD data doesn't change intraday)
+FINANCIALS_TTL = 86400  # 24 hours for financial statements (annual data)
+HISTORY_TTL = 7200      # 2 hours for price history
+SEARCH_TTL = 3600       # 1 hour for search results

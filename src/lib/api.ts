@@ -66,14 +66,12 @@ export async function fetchSummary(ticker: string): Promise<StockSummary> {
   return apiFetch<StockSummary>(`/summary/${encodeURIComponent(ticker)}`);
 }
 
-/** Fetch live quotes for multiple tickers (for the featured list). */
+/** Fetch quotes for multiple tickers in a single API call (1 SQL query). */
 export async function fetchMultipleQuotes(tickers: string[]): Promise<QuoteData[]> {
-  const results = await Promise.allSettled(
-    tickers.map((t) => fetchQuote(t))
+  if (tickers.length === 0) return [];
+  return apiFetch<QuoteData[]>(
+    `/quotes/batch?tickers=${tickers.map(encodeURIComponent).join(',')}`
   );
-  return results
-    .filter((r): r is PromiseFulfilledResult<QuoteData> => r.status === 'fulfilled')
-    .map((r) => r.value);
 }
 
 /** Get live market overview (indices). */

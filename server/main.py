@@ -456,6 +456,106 @@ async def get_market_overview():
     cache.set("market_overview", results, QUOTE_TTL)
     return results
 
+# ── Batch Quotes (1 SQL query for N tickers) ─────────────────────────────────
+@app.get("/api/quotes/batch", response_model=list[QuoteResponse])
+async def batch_quotes(tickers: str = Query(..., description="Comma-separated tickers")):
+    """Fetch lightweight quotes for multiple tickers in a single WRDS query."""
+    ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
+    if not ticker_list:
+        return []
+
+    # Check cache first — return any we already have, query only the missing ones
+    results = {}
+    missing = []
+    for t in ticker_list:
+        cached = cache.get(f"quote_light:{t}")
+        if cached:
+            results[t] = cached
+        else:
+            missing.append(t)
+
+    if not missing:
+        return [results[t] for t in ticker_list if t in results]
+
+    db = get_wrds_connection()
+    if db:
+        try:
+            # Map tickers for WRDS
+            wrds_map = {ALIASES.get(t, t): t for t in missing}
+            wrds_tickers = list(wrds_map.keys())
+
+            if len(wrds_tickers) == 1:
+                tickers_sql = f"('{wrds_tickers[0]}')"
+            else:
+                tickers_sql = str(tuple(wrds_tickers))
+
+            # Single query: latest price + previous close + company name
+            sql = f"""
+                WITH latest AS (
+                    SELECT tic, datadate,
+                           prccd/NULLIF(ajexdi,0) AS close,
+                           cshtrd AS volume, cshoc AS shares,
+                           ROW_NUMBER() OVER (PARTITION BY tic ORDER BY datadate DESC) AS rn
+                    FROM comp_na_daily_all.secd
+                    WHERE tic IN {tickers_sql}
+                ),
+                company AS (
+                    SELECT DISTINCT ON (n.tic) n.tic, c.conm AS name
+                    FROM comp_na_daily_all.company c
+                    JOIN comp_na_daily_all.names n ON c.gvkey = n.gvkey
+                    WHERE n.tic IN {tickers_sql}
+                      AND CURRENT_DATE BETWEEN n.namedt AND n.nameenddt
+                    ORDER BY n.tic, n.namedt DESC
+                )
+                SELECT l.tic, l.close, l.volume, l.shares, l.rn,
+                       co.name
+                FROM latest l
+                LEFT JOIN company co ON l.tic = co.tic
+                WHERE l.rn <= 2
+                ORDER BY l.tic, l.rn
+            """
+            df = await run_sql(db, sql)
+
+            if df is not None and not df.empty:
+                for wrds_t in wrds_tickers:
+                    orig_t = wrds_map[wrds_t]
+                    rows = df[df["tic"] == wrds_t]
+                    if rows.empty:
+                        continue
+                    today = rows[rows["rn"] == 1]
+                    prev  = rows[rows["rn"] == 2]
+                    if today.empty:
+                        continue
+                    tr = today.iloc[0]
+                    price = sf(tr["close"], 0.0)
+                    prev_close = sf(prev.iloc[0]["close"] if not prev.empty else tr["close"], price)
+                    chg = round(price - prev_close, 2)
+                    chgp = round(chg / prev_close * 100 if prev_close else 0, 2)
+                    name = str(tr["name"]) if tr.get("name") else orig_t
+
+                    q = QuoteResponse(
+                        ticker=orig_t, name=name, price=price,
+                        previousClose=prev_close, change=chg, changePercent=chgp,
+                        marketCap=None, peRatio=None, forwardPE=None,
+                        psRatio=None, pbRatio=None, beta=None,
+                        fiftyTwoWeekHigh=None, fiftyTwoWeekLow=None,
+                        volume=si(tr["volume"]), avgVolume=None,
+                        dividendYield=None, sector=None, industry=None,
+                        description=None, freeCashFlow=None,
+                        sharesOutstanding=si(tr["shares"]),
+                        totalRevenue=None, netIncome=None,
+                        totalDebt=None, totalEquity=None, debtToEquity=None,
+                        returnOnEquity=None, profitMargin=None, grossMargin=None,
+                        operatingMargin=None, revenueGrowth=None, earningsGrowth=None,
+                        currentRatio=None, trailingEps=None, bookValue=None,
+                    )
+                    results[orig_t] = q
+                    cache.set(f"quote_light:{orig_t}", q, QUOTE_TTL)
+        except Exception as e:
+            logger.warning(f"Batch quotes WRDS error: {e}")
+
+    return [results[t] for t in ticker_list if t in results]
+
 # ── Health ────────────────────────────────────────────────────────────────────
 @app.get("/api/health")
 async def health():
